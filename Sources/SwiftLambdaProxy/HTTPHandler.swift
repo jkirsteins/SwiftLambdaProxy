@@ -1,5 +1,5 @@
 //
-//  File.swift
+//  HTTPHandler.swift
 //  
 //
 //  Created by Janis Kirsteins on 21/12/2021.
@@ -9,10 +9,42 @@ import Foundation
 import NIO
 import NIOHTTP1
 import NIOFoundationCompat
+import Logging
 
+/// HTTPHandler-specific errors.
+enum HTTPHandlerError : Error, LocalizedError
+{
+    case requestDebugEncodingError
+    case responseDebugDecodingError
+    case noSuccessfulHttpUrlResponse(statusCode: Int)
+    
+    var localizedDescription: String {
+        switch(self) {
+        case .requestDebugEncodingError:
+            return "Failed to encode request JSON for debug logging."
+        case .responseDebugDecodingError:
+            return "Failed to decode response JSON for debug logging."
+        case .noSuccessfulHttpUrlResponse(let statusCode):
+            return "Received status code \(statusCode) from downstream."
+        }
+    }
+}
+
+extension Logger
+{
+    func fatalChannelError(_ message: String, channel: Channel)
+    {
+        self.error(Message(stringLiteral: message), metadata: nil)
+        _ = channel.close()
+    }
+}
+
+/// HTTP request handler (responsible for sending requests downstream and converting received responses).
 @available(macOS 12.0, *)
 class HTTPHandler: ChannelInboundHandler {
     typealias InboundIn = HTTPServerRequestPart
+    
+    let logger = Logger(label: String(reflecting: HTTPHandler.self))
     
     var head: HTTPRequestHead? = nil
     var body: ByteBuffer? = nil
@@ -33,35 +65,48 @@ class HTTPHandler: ChannelInboundHandler {
             self.body = bodyBytes
         case .end(let endHeaders):
             guard let head = self.head else {
-                fatalError("Missing request parts")
+                self.logger.fatalChannelError("Missing request parts.", channel: context.channel)
+                return
             }
             
             do {
-                try self.processRequest(head, body, endHeaders) { resp in
+                try self.processRequest(head, body, endHeaders) { (resp, error) in
                     
                     context.eventLoop.execute {
                         
-                        guard !resp.isBase64Encoded else {
-                            fatalError("Can't handle Base64 response")
+                        let channel = context.channel
+                        
+                        guard error == nil, let resp = resp else {
+                            if let handlerError = error as? HTTPHandlerError {
+                                self.logger.fatalChannelError("Couldn't process request: \(handlerError.localizedDescription)", channel: channel)
+                            } else if let error = error {
+                                self.logger.fatalChannelError("Couldn't process request: \(error.localizedDescription)", channel: channel)
+                            } else {
+                                self.logger.fatalChannelError("No response and no error received.", channel: channel)
+                            }
+                            return
                         }
                         
-                        let channel = context.channel
+                        guard !resp.isBase64Encoded else {
+                            self.logger.fatalChannelError("Can't handle Base64 response", channel: channel)
+                            return
+                        }
+                        
                         var respHead = HTTPResponseHead(version: head.version,
                                                         status: HTTPResponseStatus(statusCode: resp.statusCode))
                         
-                        print("--- Response headers ---")
                         for headerKvp in resp.headers {
-                            print("    \(headerKvp.key): \(headerKvp.value)")
                             respHead.headers.add(name: headerKvp.key, value: headerKvp.value)
                         }
-                        print("--- End response headers ---")
+                        self.logger.debug("Parsed response headers: \(respHead.headers)")
                         
                         let part = HTTPServerResponsePart.head(respHead)
                         _ = channel.write(part)
                         
                         if let bodyStr = resp.body {
                             guard let bodyData = bodyStr.data(using: .utf8) else {
-                                fatalError("Failed to convert body string to data")
+                                self.logger.fatalChannelError("Failed to convert body string to data", channel: channel)
+                                return
                             }
                             let bodyBuffer = ByteBuffer(data: bodyData)
                             
@@ -76,12 +121,12 @@ class HTTPHandler: ChannelInboundHandler {
                     }
                 }
             } catch {
-                fatalError("Error while processing request")
+                self.logger.fatalChannelError(error.localizedDescription, channel: context.channel)
             }
         }
     }
     
-    fileprivate func processRequest(_ head: HTTPRequestHead, _ body: ByteBuffer?, _ endHeaders: HTTPHeaders?, callback: @escaping (FakeApiGatewayResponse)->()) throws {
+    fileprivate func processRequest(_ head: HTTPRequestHead, _ body: ByteBuffer?, _ endHeaders: HTTPHeaders?, callback: @escaping (FakeApiGatewayResponse?, Error?)->()) throws {
         
         let method = head.method.rawValue
         let headUri = URL(string: head.uri)!
@@ -135,32 +180,40 @@ class HTTPHandler: ChannelInboundHandler {
         let jsonData = try JSONEncoder().encode(gatewayRequest)
         
         guard let jsonString = String(data: jsonData, encoding: .utf8) else {
-            fatalError("Failed to encode proxy request as JSON string")
+            callback(nil, HTTPHandlerError.requestDebugEncodingError)
+            return
         }
-        print("Forwarding:\n---\n\(jsonString)\n---\n")
+        
+        self.logger.debug("Sending request downstream: \(jsonString)")
         
         Task {
             do {
-                var req = URLRequest(url: self.options.lambdaUrl)
+                let url = self.options.getLambdaUrl()
+                var req = URLRequest(url: url)
                 req.httpMethod = "POST"
                 req.httpBody = jsonData
                 
+                logger.info("Sending request downstream.", metadata: ["url": .stringConvertible(url.absoluteString)])
                 let (data, resp) = try await URLSession.shared.data(for: req)
                 
-                guard let httpResp = resp as? HTTPURLResponse, httpResp.statusCode >= 200 && httpResp.statusCode < 300 else {
-                    fatalError("Proxy request didn't yield a response")
+                let httpResp = resp as! HTTPURLResponse
+                
+                guard httpResp.statusCode >= 200 && httpResp.statusCode < 300 else {
+                    callback(nil, HTTPHandlerError.noSuccessfulHttpUrlResponse(statusCode: httpResp.statusCode))
+                    return
                 }
                 
                 guard let respString = String(data: data, encoding: .utf8) else {
-                    fatalError("Failed to decode response as UTF8 string")
+                    callback(nil, HTTPHandlerError.responseDebugDecodingError)
+                    return
                 }
-                print("Response (\(httpResp.statusCode)):\n---\n\(respString)\n---\n")
+                self.logger.debug("Received response from downstream: \(respString)")
                 
                 let respStruct = try JSONDecoder().decode(FakeApiGatewayResponse.self, from: ByteBuffer(data: data))
                 
-                callback(respStruct)
+                callback(respStruct, nil)
             } catch {
-                fatalError("Failed to forward: \(error)")
+                callback(nil, error)
             }
         }
     }

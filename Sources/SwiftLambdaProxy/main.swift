@@ -1,19 +1,30 @@
+//
+//  main.swift
+//
+//
+//  Created by Janis Kirsteins on 21/12/2021.
+//
+
 import Foundation
 import NIO
 import NIOHTTP1
 import Lifecycle
+import Logging
 
-struct ProxyOptions {
-    let lambdaUrl: URL
+let options = ProxyOptions()
+
+LoggingSystem.bootstrap {
+    var result = StreamLogHandler.standardOutput(label: $0)
+    result.logLevel = options.logLevel
+    return result
 }
-
-let options = ProxyOptions(lambdaUrl: URL(string: "http://localhost:7000/invoke")!)
 
 @available(macOS 12.0, *)
 class Proxy {
     let elg: EventLoopGroup
     let lifecycle: ServiceLifecycle
     let options: ProxyOptions
+    let logger = Logger(label: String(reflecting: Proxy.self))
     
     init(options: ProxyOptions) {
         self.options = options
@@ -50,9 +61,10 @@ class Proxy {
         
         do {
             let serverChannel =
-            try bootstrap.bind(host: "localhost", port: 5000)
+            try bootstrap.bind(host: self.options.listenHost, port: self.options.listenPort)
                 .wait()
-            print("Server running on:", serverChannel.localAddress!)
+            
+            self.logger.info("Listening on: \(serverChannel.localAddress!)")
             
             try lifecycle.startAndWait()
         }

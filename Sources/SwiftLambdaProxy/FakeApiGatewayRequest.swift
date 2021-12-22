@@ -1,5 +1,5 @@
 //
-//  File.swift
+//  FakeApiGatewayRequest.swift
 //  
 //
 //  Created by Janis Kirsteins on 21/12/2021.
@@ -35,6 +35,7 @@ import Foundation
  }
  */
 
+/// Structure mimicking API Gateway request. Not all fields are set properly.
 struct FakeApiGatewayRequest : Codable
 {
     struct RequestContext : Codable
