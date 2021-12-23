@@ -16,10 +16,13 @@ enum HTTPHandlerError : Error, LocalizedError
 {
     case requestDebugEncodingError
     case responseDebugDecodingError
+    case requestMissingUrl
     case noSuccessfulHttpUrlResponse(statusCode: Int)
     
     var localizedDescription: String {
         switch(self) {
+        case .requestMissingUrl:
+            return "A well-formed URL can not be formed from the HTTP request."
         case .requestDebugEncodingError:
             return "Failed to encode request JSON for debug logging."
         case .responseDebugDecodingError:
@@ -129,7 +132,11 @@ class HTTPHandler: ChannelInboundHandler {
     fileprivate func processRequest(_ head: HTTPRequestHead, _ body: ByteBuffer?, _ endHeaders: HTTPHeaders?, callback: @escaping (FakeApiGatewayResponse?, Error?)->()) throws {
         
         let method = head.method.rawValue
-        let headUri = URL(string: head.uri)!
+        
+        guard let headUri = URL(string: head.uri) else {
+            callback(nil, HTTPHandlerError.requestMissingUrl)
+            return
+        }
         
         let bodyString: String?
         if let body = body {
