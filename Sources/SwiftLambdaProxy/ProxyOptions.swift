@@ -8,6 +8,27 @@
 import Foundation
 import Logging
 
+enum LambdaApiType {
+    case http
+    case rest
+}
+
+extension LambdaApiType : OptionParseable
+{
+    static func parse(name: String, value: String) -> LambdaApiType {
+        switch(value.lowercased()) {
+        case "http":
+            return .http
+        case "rest":
+            return .rest
+        default:
+            fatalError("Invalid value (must be http or rest) for environment variable \(name).")
+        }
+    }
+    
+    typealias OutValue = LambdaApiType
+}
+
 /// Proxy options specifiable via environment variables.
 struct ProxyOptions {
     @FromEnv("LAMBDA_HOST") var lambdaHost: String = "127.0.0.1"
@@ -17,6 +38,8 @@ struct ProxyOptions {
     @FromEnv("LISTEN_PORT") var listenPort: Int = 5000
     
     @FromEnv("LOG_LEVEL") var logLevel: Logger.Level = .info
+    
+    @FromEnv("API_TYPE") var apiType: LambdaApiType = .rest
     
     func getLambdaUrl() -> URL {
         URL(string: "http://\(lambdaHost):\(lambdaPort)/invoke")!
